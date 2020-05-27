@@ -3,10 +3,14 @@
 #endif 
 
 #include <windows.h>
+#include <strsafe.h>
 #include <stdint.h>
 
-const int32_t NCELLS_X = 400;
-const int32_t NCELLS_Y = 260;
+#define USE_STRETCH_DI_BITS 0
+#define USE_LIDKA_PRED 0
+
+const int32_t NCELLS_X = 360;
+const int32_t NCELLS_Y = 240;
 const int32_t PIXELS_PER_CELL = 4;
 const int32_t BYTES_PER_PIXEL = 4;
 const uint32_t COLOR_DEAD = 0x00222222;
@@ -16,10 +20,13 @@ const int32_t WINDOW_HEIGHT = NCELLS_Y * PIXELS_PER_CELL;
 const int32_t WINDOW_WIDTH =  NCELLS_X * PIXELS_PER_CELL;
 const uint32_t colors[2] = {COLOR_DEAD, COLOR_ALIVE};
 
+const size_t BUFFER_SIZE = 512;
+
 static struct {
     void * buffer;
     BITMAPINFO bitmap_info;
-    HDC device_context;
+    HDC back_buffer_context;
+    HBITMAP hbitmap;
 } screen;
 
 static bool running = true;
@@ -107,13 +114,22 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam);
 
 void Win32UpdateWindow(HDC device_context, int32_t x, int32_t y, int32_t width, int32_t height)
 {
+#if USE_STRETCH_DI_BITS
     StretchDIBits(device_context, 
-            0, 0, WINDOW_WIDTH, WINDOW_HEIGHT, 
-            0, 0, WINDOW_WIDTH, WINDOW_HEIGHT, 
+            x, y, width, height, 
+            x, y, width, height, 
             screen.buffer, 
             &screen.bitmap_info,
             DIB_RGB_COLORS,
             SRCCOPY);
+#else
+    BitBlt( device_context,
+          x, y,
+          width, height,
+          screen.back_buffer_context,
+          x, y,
+          SRCCOPY);
+#endif
 }
 
 void Win32AllocateScreenBuffer(int32_t width, int32_t height) {
@@ -124,7 +140,18 @@ void Win32AllocateScreenBuffer(int32_t width, int32_t height) {
     screen.bitmap_info.bmiHeader.biBitCount = 32;
     screen.bitmap_info.bmiHeader.biCompression = BI_RGB;
 
+#if USE_STRETCH_DI_BITS
     screen.buffer = VirtualAlloc(0, (width * height * BYTES_PER_PIXEL), MEM_COMMIT, PAGE_READWRITE);
+#else
+    screen.back_buffer_context = CreateCompatibleDC(0);
+    screen.hbitmap = CreateDIBSection( 
+          screen.back_buffer_context,
+          &screen.bitmap_info,
+          DIB_RGB_COLORS,
+          &screen.buffer,
+          0, 0);
+    SelectObject(screen.back_buffer_context, screen.hbitmap);
+#endif
 
     uint32_t * pixel = (uint32_t *)screen.buffer;
     for (auto i = 0; i < width*height; i++)
@@ -203,12 +230,38 @@ void lidka_pred(uint8_t* board, uint32_t x, uint32_t y, uint32_t dir_x = 1, uint
     board[start + bcoord(dir_x * 8, dir_y * 5)] = 1;
 }
 
+void spaceship(uint8_t* board, uint32_t x, uint32_t y, uint32_t dir_x = 1, uint32_t dir_y = 1)
+{
+    auto start = bcoord(x, y);
+    board[start + bcoord(dir_x * 0, dir_y * 1)] = 1;
+    board[start + bcoord(dir_x * 0, dir_y * 2)] = 1;
+    board[start + bcoord(dir_x * 0, dir_y * 3)] = 1;
+    board[start + bcoord(dir_x * 1, dir_y * 0)] = 1;
+    board[start + bcoord(dir_x * 1, dir_y * 3)] = 1;
+    board[start + bcoord(dir_x * 2, dir_y * 3)] = 1;
+    board[start + bcoord(dir_x * 3, dir_y * 3)] = 1;
+    board[start + bcoord(dir_x * 4, dir_y * 0)] = 1;
+    board[start + bcoord(dir_x * 4, dir_y * 2)] = 1;
+}
+
+void game_update_and_render()
+{
+   update_board(current_board, next_board, 1, 1, NCELLS_X, NCELLS_Y);
+   swap_boards();
+   render_board(current_board, 1, 1, NCELLS_X + 1, NCELLS_Y+1);
+}
 
 
 int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR pCmdLine, int nCmdShow)
 {
     // Register the window class.
     const wchar_t CLASS_NAME[]  = L"GameOfLifeWindow";
+    LARGE_INTEGER StartingTime, EndingTime, ElapsedUsWork, ElapsedUsTotal, ElapsedUsUpdateRender;
+    LARGE_INTEGER Frequency;
+    LARGE_INTEGER TargerUsPerFrame;
+    TargerUsPerFrame.QuadPart = (1000 * 1000) / 30;
+    QueryPerformanceFrequency(&Frequency); 
+    char buffer[BUFFER_SIZE];
 
     WNDCLASS wc = { };
 
@@ -247,24 +300,36 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR pCmdLine, int nCmdShow
 
     ShowWindow(hwnd, nCmdShow);
 
+#if USE_LIDKA_PRED
     lidka_pred(current_board, NCELLS_X / 2, NCELLS_Y / 2);
-
-
-    // const int32_t lut[] = {305, 295, 405, 195};
-    // for (uint32_t i = 0; i < 32; i++)
-    // {
-    //     auto x = lut[i & 0x3];
-    //     auto y = (i/4) * 25 + ((i < 16) ? 120 : 105);
-    //     auto dx = (i % 2 == 0) ? 1 : -1;
-    //     auto dy = (i < 16) ? -1 : 1;
-    //     glider_gun(current_board, x, y, dx, dy);
-    //     update_board(current_board, next_board, 1, 1, NCELLS_X, NCELLS_Y);
-    //     swap_boards();
-    // }
+#else
+    const int32_t lut[] = {(5*NCELLS_X)/6, (NCELLS_X / 2 - 5), (NCELLS_X / 2 + 5), (1*NCELLS_X)/6};
+    for (uint32_t i = 0; i < 32; i++)
+    {
+        auto x = lut[i & 0x3];
+        auto y = (9*NCELLS_Y / 16) + (((i/4) - 4) * ((12 * NCELLS_Y) / 100));
+        auto dx = (i % 2 == 0) ? 1 : -1;
+        auto dy = (i < 16) ? -1 : 1;
+        glider_gun(current_board, x, y, dx, dy);
+        update_board(current_board, next_board, 1, 1, NCELLS_X, NCELLS_Y);
+        swap_boards();
+    }
+    spaceship(current_board, NCELLS_X - 8, NCELLS_Y / 2 + 2);
+    spaceship(current_board, 8, NCELLS_Y / 2 - 2, -1, -1);
+#endif
 
     MSG msg = { };
     while (running)
     {
+        QueryPerformanceCounter(&StartingTime);
+
+        game_update_and_render();
+
+        QueryPerformanceCounter(&EndingTime);
+        ElapsedUsUpdateRender.QuadPart = EndingTime.QuadPart - StartingTime.QuadPart;
+        ElapsedUsUpdateRender.QuadPart *= 1000000;
+        ElapsedUsUpdateRender.QuadPart /= Frequency.QuadPart;
+
         while (PeekMessage(&msg, NULL, 0, 0, PM_REMOVE))
         {
             if (msg.message == WM_QUIT) {
@@ -274,10 +339,6 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR pCmdLine, int nCmdShow
             DispatchMessage(&msg);
         }
 
-        update_board(current_board, next_board, 1, 1, NCELLS_X, NCELLS_Y);
-        swap_boards();
-        render_board(current_board, 1, 1, NCELLS_X + 1, NCELLS_Y+1);
-
         HDC hdc = GetDC(hwnd);
         RECT client_rect;
         GetClientRect(hwnd, &client_rect);
@@ -285,7 +346,26 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR pCmdLine, int nCmdShow
         auto height = client_rect.bottom - client_rect.top;
         Win32UpdateWindow(hdc, 0, 0, width, height);
 
-        Sleep(50);
+        QueryPerformanceCounter(&EndingTime);
+        ElapsedUsWork.QuadPart = EndingTime.QuadPart - StartingTime.QuadPart;
+        ElapsedUsWork.QuadPart *= 1000000;
+        ElapsedUsWork.QuadPart /= Frequency.QuadPart;
+
+        if (ElapsedUsWork.QuadPart > TargerUsPerFrame.QuadPart)
+        {
+           OutputDebugStringA("Missed frame");
+        } else {
+           uint32_t sleep_ms = (TargerUsPerFrame.QuadPart - ElapsedUsWork.QuadPart) / 1000;
+           Sleep(sleep_ms);
+        }
+
+        QueryPerformanceCounter(&EndingTime);
+        ElapsedUsTotal.QuadPart = EndingTime.QuadPart - StartingTime.QuadPart;
+        ElapsedUsTotal.QuadPart *= 1000000;
+        ElapsedUsTotal.QuadPart /= Frequency.QuadPart;
+
+        StringCbPrintfA(buffer, BUFFER_SIZE, "UpdateRender: %8lld us Work: %8lld us, Total: %8lld us\b", ElapsedUsUpdateRender.QuadPart, ElapsedUsWork.QuadPart, ElapsedUsTotal.QuadPart);
+        OutputDebugStringA(buffer);
     }
 
     return 0;
