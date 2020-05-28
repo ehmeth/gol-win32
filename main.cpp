@@ -8,10 +8,11 @@
 
 #define USE_STRETCH_DI_BITS 0
 #define USE_LIDKA_PRED 0
+#define USE_MULTI_THREAD 1
 
-const int32_t NCELLS_X = 400;
-const int32_t NCELLS_Y = 240;
-const int32_t PIXELS_PER_CELL = 4;
+const int32_t NCELLS_X = 1600;
+const int32_t NCELLS_Y = 960;
+const int32_t PIXELS_PER_CELL = 1;
 const int32_t BYTES_PER_PIXEL = 4;
 const uint32_t COLOR_DEAD = 0x00222222;
 const uint32_t COLOR_ALIVE = 0x00fed844;
@@ -427,9 +428,10 @@ void render_chunck_handler(void * param)
 
 void game_update_and_render()
 {
+#if USE_MULTI_THREAD
    chunk_spec_t chunk;
-   uint32_t y_step = 16;
-   uint32_t x_step = 16;
+   uint32_t y_step = 64;
+   uint32_t x_step = 64;
    uint32_t starty = 1;
    uint32_t endy = min2(starty+y_step, NCELLS_Y);
 
@@ -476,6 +478,11 @@ void game_update_and_render()
       endy   = min2(endy + y_step, NCELLS_Y+1);
    }
    job_queue_wait_until_done();
+#else
+   update_board(current_board, next_board, 1, 1, NCELLS_X, NCELLS_Y);
+   swap_boards();
+   render_board(current_board, 1, 1, NCELLS_X+1, NCELLS_Y+1);
+#endif
 }
 
 
