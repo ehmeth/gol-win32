@@ -9,12 +9,16 @@
 #define USE_STRETCH_DI_BITS 0
 #define USE_LIDKA_PRED 0
 
-const int32_t NCELLS_X = 360;
+const int32_t NCELLS_X = 400;
 const int32_t NCELLS_Y = 240;
 const int32_t PIXELS_PER_CELL = 4;
 const int32_t BYTES_PER_PIXEL = 4;
 const uint32_t COLOR_DEAD = 0x00222222;
 const uint32_t COLOR_ALIVE = 0x00fed844;
+
+const uint32_t JOB_QUEUE_WORKERS = 3;
+const uint32_t JOB_QUEUE_SIZE = 10;
+const uint32_t JOB_QUEUE_PARAMS_SIZE = 40;
 
 const int32_t WINDOW_HEIGHT = NCELLS_Y * PIXELS_PER_CELL;
 const int32_t WINDOW_WIDTH =  NCELLS_X * PIXELS_PER_CELL;
@@ -31,21 +35,25 @@ static struct {
 
 static bool running = true;
 
-uint8_t boards[2][(NCELLS_Y + 2) * (NCELLS_X + 2)];
-uint8_t * current_board = boards[0];
-uint8_t * next_board = boards[1];
+uint32_t boards[2][(NCELLS_Y + 2) * (NCELLS_X + 2)];
+uint32_t * current_board = boards[0];
+uint32_t * next_board = boards[1];
 
 static inline uint32_t bcoord(uint32_t x, uint32_t y) { return y * NCELLS_X + x; }
+static inline uint32_t min2(uint32_t a, uint32_t b) { return (a < b) ? a : b; }
 
 static inline void swap_boards()
 {
-    uint8_t * temp = current_board;
+    uint32_t * temp = current_board;
     current_board = next_board;
     next_board = temp;
 }
 
-static void update_board(uint8_t* old_board, uint8_t* new_board, int32_t startx, int32_t starty, int32_t endx, int32_t endy)
+static void update_board(uint32_t* old_board, uint32_t* new_board, int32_t startx, int32_t starty, int32_t endx, int32_t endy)
 {
+   char buffer[BUFFER_SIZE];
+   StringCbPrintfA(buffer, BUFFER_SIZE, "tid: %8X x: %d..%d, y: %d..%d\n", GetCurrentThreadId(), startx, endx, starty, endy);
+   OutputDebugStringA(buffer);
     for (auto y = starty; y < endy; y++)
     {
         for (auto x = startx; x < endx; x++) 
@@ -94,7 +102,7 @@ void Win32DrawRect(int32_t start_x, int32_t start_y, int32_t end_x, int32_t end_
 }
                 
 
-void render_board(uint8_t* board, int32_t startx, int32_t starty, int32_t endx, int32_t endy)
+void render_board(uint32_t* board, int32_t startx, int32_t starty, int32_t endx, int32_t endy)
 {
     for (auto y = starty; y < endy; y++)
     {
@@ -161,7 +169,7 @@ void Win32AllocateScreenBuffer(int32_t width, int32_t height) {
     }
 }
 
-void glider_gun(uint8_t* board, uint32_t x, uint32_t y, uint32_t dir_x = 1, uint32_t dir_y = 1)
+void glider_gun(uint32_t* board, uint32_t x, uint32_t y, uint32_t dir_x = 1, uint32_t dir_y = 1)
 {
     auto start = bcoord(x, y);
     board[start + bcoord(dir_x *  0, dir_y * 4)] = 1;
@@ -202,7 +210,7 @@ void glider_gun(uint8_t* board, uint32_t x, uint32_t y, uint32_t dir_x = 1, uint
     board[start + bcoord(dir_x * 35, dir_y * 3)] = 1;
 }
 
-void glider(uint8_t* board, uint32_t x, uint32_t y, uint32_t dir_x = 1, uint32_t dir_y = 1)
+void glider(uint32_t* board, uint32_t x, uint32_t y, uint32_t dir_x = 1, uint32_t dir_y = 1)
 {
     auto start = bcoord(x, y);
     board[start + bcoord(dir_x * 2, dir_y * 0)] = 1;
@@ -212,7 +220,7 @@ void glider(uint8_t* board, uint32_t x, uint32_t y, uint32_t dir_x = 1, uint32_t
     board[start + bcoord(dir_x * 0, dir_y * 1)] = 1;
 }
 
-void lidka_pred(uint8_t* board, uint32_t x, uint32_t y, uint32_t dir_x = 1, uint32_t dir_y = 1)
+void lidka_pred(uint32_t* board, uint32_t x, uint32_t y, uint32_t dir_x = 1, uint32_t dir_y = 1)
 {
     auto start = bcoord(x, y);
     board[start + bcoord(dir_x * 0, dir_y * 5)] = 1;
@@ -230,7 +238,7 @@ void lidka_pred(uint8_t* board, uint32_t x, uint32_t y, uint32_t dir_x = 1, uint
     board[start + bcoord(dir_x * 8, dir_y * 5)] = 1;
 }
 
-void spaceship(uint8_t* board, uint32_t x, uint32_t y, uint32_t dir_x = 1, uint32_t dir_y = 1)
+void spaceship(uint32_t* board, uint32_t x, uint32_t y, uint32_t dir_x = 1, uint32_t dir_y = 1)
 {
     auto start = bcoord(x, y);
     board[start + bcoord(dir_x * 0, dir_y * 1)] = 1;
@@ -244,11 +252,230 @@ void spaceship(uint8_t* board, uint32_t x, uint32_t y, uint32_t dir_x = 1, uint3
     board[start + bcoord(dir_x * 4, dir_y * 2)] = 1;
 }
 
+typedef void (*job_handler_t)(void *);
+
+enum job_status_t {
+   JOB_FREE,
+   JOB_AVAILABLE,
+   JOB_PENDING
+};
+
+struct job_spec_t {
+   job_status_t status;
+   job_handler_t handler;
+   uint8_t params[JOB_QUEUE_PARAMS_SIZE];
+};
+
+static struct {
+   HANDLE work_event;
+   CRITICAL_SECTION cs;
+   bool running;
+   job_spec_t specs[JOB_QUEUE_SIZE];
+} job_queue;
+
+DWORD job_queue_worker(void * param) {
+   while (job_queue.running)
+   {
+      WaitForSingleObject(job_queue.work_event, INFINITE);
+      
+      bool found = false;
+      uint32_t job_index;
+      EnterCriticalSection(&job_queue.cs);
+      for (auto i = 0; (i < JOB_QUEUE_SIZE) && !found; i++)
+      {
+         if (job_queue.specs[i].status == JOB_AVAILABLE) {
+            job_queue.specs[i].status = JOB_PENDING;
+            found = true;
+            job_index = i;
+         }
+      }
+      LeaveCriticalSection(&job_queue.cs);
+      if (found) {
+         job_queue.specs[job_index].handler(job_queue.specs[job_index].params);
+         EnterCriticalSection(&job_queue.cs);
+         job_queue.specs[job_index].status = JOB_FREE;
+         LeaveCriticalSection(&job_queue.cs);
+      }
+   }
+
+   return 0;
+}
+
+void job_queue_init()
+{
+   job_queue.work_event = CreateEvent(NULL, TRUE, FALSE, NULL);
+   InitializeCriticalSection(&job_queue.cs);
+   job_queue.running = true;
+   for (auto i = 0; i < JOB_QUEUE_SIZE; i++)
+   {
+      job_queue.specs[i].handler = NULL;
+      job_queue.specs[i].status = JOB_FREE;
+   }
+
+   for (auto i = 0; i < JOB_QUEUE_WORKERS; i++) {
+      HANDLE thread = CreateThread( 0, 0,
+            job_queue_worker, NULL,
+            0, 0); 
+      if (thread != NULL) {
+         CloseHandle(thread);
+      } else {
+         OutputDebugStringA("Thread creation failed");
+      }
+   }
+}
+
+void job_queue_push(job_handler_t handler, void * data, uint32_t data_len)
+{
+   bool queued = false;
+   // OutputDebugStringA("job pushed");
+
+   EnterCriticalSection(&job_queue.cs);
+   for (auto i = 0; (i < JOB_QUEUE_SIZE) && !queued; i++)
+   {
+      if (job_queue.specs[i].status == JOB_FREE) {
+         job_queue.specs[i].handler = handler;
+         memcpy_s(job_queue.specs[i].params, JOB_QUEUE_PARAMS_SIZE, data, data_len);
+         job_queue.specs[i].status = JOB_AVAILABLE;
+         queued = true;
+         // OutputDebugStringA("job queued");
+         SetEvent(job_queue.work_event);
+      }
+   }
+   LeaveCriticalSection(&job_queue.cs);
+
+   if (!queued) {
+      handler(data);
+   }
+}
+
+void job_queue_wait_until_done()
+{
+   bool all_done = false;
+   bool all_started = false;
+
+   // OutputDebugStringA("Wait for done");
+
+   while (!all_started)
+   {
+      all_started = true;
+      bool found = false;
+      uint32_t job_index;
+
+      EnterCriticalSection(&job_queue.cs);
+      for (auto i = 0; (i < JOB_QUEUE_SIZE) && !found; i++)
+      {
+         if (job_queue.specs[i].status == JOB_AVAILABLE) {
+            job_queue.specs[i].status = JOB_PENDING;
+            found = true;
+            all_started = false;
+            job_index = i;
+         } 
+      }
+      LeaveCriticalSection(&job_queue.cs);
+
+      if (found) {
+         job_queue.specs[job_index].handler(job_queue.specs[job_index].params);
+         EnterCriticalSection(&job_queue.cs);
+         job_queue.specs[job_index].status = JOB_FREE;
+         LeaveCriticalSection(&job_queue.cs);
+      }
+   }
+
+   ResetEvent(job_queue.work_event);
+   while (!all_done) {
+      all_done = true;
+      EnterCriticalSection(&job_queue.cs);
+      for (auto i = 0; (i < JOB_QUEUE_SIZE) && all_done; i++)
+      {
+         if (job_queue.specs[i].status != JOB_FREE) {
+            all_started = false;
+         } 
+      }
+      LeaveCriticalSection(&job_queue.cs);
+   }
+
+}
+
+struct chunk_spec_t {
+   uint32_t startx;
+   uint32_t starty;
+   uint32_t endx;
+   uint32_t endy;
+};
+
+void update_chunck_handler(void * param)
+{
+   chunk_spec_t * chunk = (chunk_spec_t *)param;
+
+   update_board(current_board, next_board, 
+         chunk->startx, 
+         chunk->starty, 
+         chunk->endx, 
+         chunk->endy);
+}
+
+void render_chunck_handler(void * param)
+{
+   chunk_spec_t * chunk = (chunk_spec_t *)param;
+
+   render_board(current_board,
+         chunk->startx, 
+         chunk->starty, 
+         chunk->endx, 
+         chunk->endy);
+}
+
 void game_update_and_render()
 {
-   update_board(current_board, next_board, 1, 1, NCELLS_X, NCELLS_Y);
+   chunk_spec_t chunk;
+   uint32_t y_step = 16;
+   uint32_t x_step = 16;
+   uint32_t starty = 1;
+   uint32_t endy = min2(starty+y_step, NCELLS_Y);
+
+   // OutputDebugStringA("Update");
+   while (starty < NCELLS_Y) {
+      uint32_t startx = 1;
+      uint32_t endx = min2(startx+x_step, NCELLS_X);
+      chunk.starty = starty;
+      chunk.endy   = endy;
+      while (startx < NCELLS_X) {
+         chunk.startx = startx;
+         chunk.endx   = endx;
+
+         job_queue_push(update_chunck_handler, &chunk, sizeof(chunk));
+
+         startx = min2(startx + x_step, NCELLS_X);
+         endx   = min2(endx + x_step, NCELLS_X);
+      }
+      starty = min2(starty + y_step, NCELLS_Y);
+      endy   = min2(endy + y_step, NCELLS_Y);
+   }
+   job_queue_wait_until_done();
+
    swap_boards();
-   render_board(current_board, 1, 1, NCELLS_X + 1, NCELLS_Y+1);
+
+   // OutputDebugStringA("Render");
+   starty = 1;
+   endy = min2(starty+y_step, NCELLS_Y+1);
+   while (starty < NCELLS_Y+1) {
+      uint32_t startx = 1;
+      uint32_t endx = min2(startx+x_step, NCELLS_X+1);
+      chunk.starty = starty;
+      chunk.endy   = endy;
+      while (startx < NCELLS_X+1) {
+         chunk.startx = startx;
+         chunk.endx   = endx;
+
+         job_queue_push(render_chunck_handler, &chunk, sizeof(chunk));
+
+         startx = min2(startx + x_step, NCELLS_X+1);
+         endx   = min2(endx + x_step, NCELLS_X+1);
+      }
+      starty = min2(starty + y_step, NCELLS_Y+1);
+      endy   = min2(endy + y_step, NCELLS_Y+1);
+   }
+   job_queue_wait_until_done();
 }
 
 
@@ -295,6 +522,8 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR pCmdLine, int nCmdShow
     {
         return 0;
     }
+
+    job_queue_init();
 
     Win32AllocateScreenBuffer(WINDOW_WIDTH, WINDOW_HEIGHT);
 
@@ -364,7 +593,7 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR pCmdLine, int nCmdShow
         ElapsedUsTotal.QuadPart *= 1000000;
         ElapsedUsTotal.QuadPart /= Frequency.QuadPart;
 
-        StringCbPrintfA(buffer, BUFFER_SIZE, "UpdateRender: %8lld us Work: %8lld us, Total: %8lld us\b", ElapsedUsUpdateRender.QuadPart, ElapsedUsWork.QuadPart, ElapsedUsTotal.QuadPart);
+        StringCbPrintfA(buffer, BUFFER_SIZE, "UpdateRender: %8lld us Work: %8lld us, Total: %8lld us\n", ElapsedUsUpdateRender.QuadPart, ElapsedUsWork.QuadPart, ElapsedUsTotal.QuadPart);
         OutputDebugStringA(buffer);
     }
 
