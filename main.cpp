@@ -51,9 +51,9 @@ static inline void swap_boards()
 
 static void update_board(uint32_t* old_board, uint32_t* new_board, int32_t startx, int32_t starty, int32_t endx, int32_t endy)
 {
-   char buffer[BUFFER_SIZE];
-   StringCbPrintfA(buffer, BUFFER_SIZE, "tid: %8X x: %d..%d, y: %d..%d\n", GetCurrentThreadId(), startx, endx, starty, endy);
-   OutputDebugStringA(buffer);
+   // char buffer[BUFFER_SIZE];
+   // StringCbPrintfA(buffer, BUFFER_SIZE, "tid: %8X x: %d..%d, y: %d..%d\n", GetCurrentThreadId(), startx, endx, starty, endy);
+   // OutputDebugStringA(buffer);
     for (auto y = starty; y < endy; y++)
     {
         for (auto x = startx; x < endx; x++) 
@@ -388,7 +388,7 @@ void job_queue_wait_until_done()
       for (auto i = 0; (i < JOB_QUEUE_SIZE) && all_done; i++)
       {
          if (job_queue.specs[i].status != JOB_FREE) {
-            all_started = false;
+            all_done = false;
          } 
       }
       LeaveCriticalSection(&job_queue.cs);
@@ -486,6 +486,9 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR pCmdLine, int nCmdShow
     LARGE_INTEGER StartingTime, EndingTime, ElapsedUsWork, ElapsedUsTotal, ElapsedUsUpdateRender;
     LARGE_INTEGER Frequency;
     LARGE_INTEGER TargerUsPerFrame;
+    uint64_t work_accumulator = 0, total_accumulator = 0, update_render_accumulator = 0;
+    const uint32_t max_accumulator = 60;
+    int32_t accumulator = 0;
     TargerUsPerFrame.QuadPart = (1000 * 1000) / 30;
     QueryPerformanceFrequency(&Frequency); 
     char buffer[BUFFER_SIZE];
@@ -558,6 +561,7 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR pCmdLine, int nCmdShow
         ElapsedUsUpdateRender.QuadPart = EndingTime.QuadPart - StartingTime.QuadPart;
         ElapsedUsUpdateRender.QuadPart *= 1000000;
         ElapsedUsUpdateRender.QuadPart /= Frequency.QuadPart;
+        update_render_accumulator += ElapsedUsUpdateRender.QuadPart;
 
         while (PeekMessage(&msg, NULL, 0, 0, PM_REMOVE))
         {
@@ -579,6 +583,7 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR pCmdLine, int nCmdShow
         ElapsedUsWork.QuadPart = EndingTime.QuadPart - StartingTime.QuadPart;
         ElapsedUsWork.QuadPart *= 1000000;
         ElapsedUsWork.QuadPart /= Frequency.QuadPart;
+        work_accumulator += ElapsedUsWork.QuadPart;
 
         if (ElapsedUsWork.QuadPart > TargerUsPerFrame.QuadPart)
         {
@@ -592,9 +597,21 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR pCmdLine, int nCmdShow
         ElapsedUsTotal.QuadPart = EndingTime.QuadPart - StartingTime.QuadPart;
         ElapsedUsTotal.QuadPart *= 1000000;
         ElapsedUsTotal.QuadPart /= Frequency.QuadPart;
+        total_accumulator += ElapsedUsTotal.QuadPart;
 
-        StringCbPrintfA(buffer, BUFFER_SIZE, "UpdateRender: %8lld us Work: %8lld us, Total: %8lld us\n", ElapsedUsUpdateRender.QuadPart, ElapsedUsWork.QuadPart, ElapsedUsTotal.QuadPart);
-        OutputDebugStringA(buffer);
+        if (accumulator++ >= max_accumulator)
+        {
+           StringCbPrintfA(buffer, BUFFER_SIZE, "AVG UpdateRender: %8lld us Work: %8lld us, Total: %8lld us\n", 
+                 update_render_accumulator / max_accumulator, 
+                 work_accumulator / max_accumulator, 
+                 total_accumulator / max_accumulator);
+           OutputDebugStringA(buffer);
+
+           update_render_accumulator = 0;
+           work_accumulator          = 0;
+           total_accumulator         = 0;
+           accumulator               = 0;
+        }
     }
 
     return 0;
